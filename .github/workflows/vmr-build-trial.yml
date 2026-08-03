@@ -41,6 +41,11 @@ on:
         type: string
         required: false
         default: ""
+      branding:
+        description: "--branding: release drops the '-ci' version suffix. Empty to use VMR defaults."
+        type: string
+        required: false
+        default: release
       reclaim_disk:
         description: "Delete preinstalled toolchains first. Unnecessary: runners have 145 GB with ~88 GB free."
         type: boolean
@@ -152,6 +157,10 @@ jobs:
         working-directory: vmr
         run: |
           args=( --clean-while-building --ci )
+          # --ci alone stamped the output "dotnet-sdk-11.0.100-ci-...". --branding
+          # release drops that suffix, which a conda recipe would need since the
+          # package version has to be the real SDK version.
+          if [ -n "${{ inputs.branding }}" ]; then args+=( --branding "${{ inputs.branding }}" ); fi
           if [ "${{ inputs.mode }}" = "source-build" ]; then args+=( -sb --online ); fi
           if [ -n "${{ inputs.system_libs }}" ]; then args+=( --with-system-libs "${{ inputs.system_libs }}" ); fi
           if [ -n "${{ inputs.target_rid }}" ]; then args+=( --rid "${{ inputs.target_rid }}" ); fi
@@ -191,16 +200,28 @@ jobs:
             echo '```'
             ls -lh vmr/artifacts/assets/Release/ 2>/dev/null || echo "(none -- build did not reach asset packaging)"
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          # tee, not >>: GITHUB_STEP_SUMMARY is not visible in the run log or via
+          # the API, so summary-only output cannot be read back with `gh run view`.
+          } | tee -a "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload samples and logs
+      # Split into two artifacts on purpose. Bundling the ~1.5 GB SDK tarball
+      # with the logs meant fetching the metrics required a 1.5 GB download.
+      - name: Upload metrics and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: vmr-trial-${{ inputs.mode }}-${{ inputs.runner }}
+          name: metrics-${{ inputs.mode }}-${{ inputs.runner }}
           if-no-files-found: warn
           retention-days: 14
           path: |
             /tmp/samples.csv
             vmr/artifacts/log/**
-            vmr/artifacts/assets/Release/*.tar.gz
+
+      - name: Upload built SDK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdk-${{ inputs.mode }}-${{ inputs.runner }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: vmr/artifacts/assets/Release/*.tar.gz
