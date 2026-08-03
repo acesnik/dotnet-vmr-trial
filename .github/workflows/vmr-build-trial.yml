@@ -31,11 +31,21 @@ on:
         type: string
         required: false
         default: brotli+libunwind+rapidjson+zlib+zstd
+      # Left empty deliberately. --rid only sets /p:TargetRid, and setting it
+      # flipped the build to -portablebuild=false; on the arm runner it also
+      # produced the incoherent "-arm64 ... -targetrid linux-x64". Getting a
+      # portable RID is a recipe-design question, not a prerequisite for
+      # measuring build cost, so accept the distro-stamped default for now.
       target_rid:
-        description: "--rid to force a portable RID; empty to accept the distro-stamped default"
+        description: "--rid override; leave empty to accept the distro-stamped default (recommended)"
         type: string
         required: false
-        default: linux-x64
+        default: ""
+      reclaim_disk:
+        description: "Delete preinstalled toolchains first. Unnecessary: runners have 145 GB with ~88 GB free."
+        type: boolean
+        required: false
+        default: false
       runner:
         description: "Runner label"
         type: choice
@@ -61,9 +71,12 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      # Inlined rather than using a third-party action, so there is no unpinned
-      # external dependency in a workflow that runs for hours.
+      # Off by default: the first trial runs showed 145 GB disks with 88 GB free
+      # at baseline and 103 GB still free when the build died, so this reclaims
+      # 24 GB nobody needs and costs ~80s. Kept behind a flag in case a full
+      # build turns out to be far hungrier than the failed runs revealed.
       - name: Reclaim disk space
+        if: inputs.reclaim_disk
         run: |
           before=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
           sudo rm -rf \
@@ -84,7 +97,16 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             cmake llvm lld clang build-essential python-is-python3 curl git \
             libicu-dev liblttng-ust-dev libssl-dev libnuma-dev libkrb5-dev \
-            zlib1g-dev ninja-build libbrotli-dev locales-all
+            zlib1g-dev ninja-build locales-all \
+            libbrotli-dev libunwind-dev rapidjson-dev libzstd-dev
+          # IMPORTANT: every library named in --with-system-libs must have its
+          # -dev package here. The first two trial runs both died at CMake with
+          # "Cannot find libunwind" because --with-system-libs requested five
+          # libs (brotli+libunwind+rapidjson+zlib+zstd) while only brotli and
+          # zlib were installed. Keep these two lists in sync.
+          for pkg in libbrotli-dev libunwind-dev rapidjson-dev libzstd-dev zlib1g-dev; do
+            dpkg -s "$pkg" >/dev/null 2>&1 || { echo "::error::$pkg missing"; exit 1; }
+          done
 
       - name: Clone the VMR
         run: |
