@@ -217,11 +217,15 @@ jobs:
             /tmp/samples.csv
             vmr/artifacts/log/**
 
+      # Recursive glob: the SDK is not at the top of assets/Release/ but nested,
+      # e.g. assets/Release/Sdk/10.0.302-servicing/dotnet-sdk-10.0.302-linux-x64.tar.gz.
+      # A non-recursive *.tar.gz silently uploaded nothing on run 30788532867.
+      # if-no-files-found: error so a future miss is loud rather than silent.
       - name: Upload built SDK
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: sdk-${{ inputs.mode }}-${{ inputs.runner }}
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 14
-          path: vmr/artifacts/assets/Release/*.tar.gz
+          path: vmr/artifacts/assets/Release/**/*.tar.gz
