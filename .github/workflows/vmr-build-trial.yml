@@ -1,0 +1,184 @@
+# Measurement harness for the "build dotnet in conda-forge instead of repackaging" question.
+#
+# This is NOT a feedstock build. It answers one question: does a VMR build fit
+# inside conda-forge CI limits? The timeout below is deliberately set to 360
+# minutes because that is conda-forge's `timeout_minutes` default -- if a build
+# cannot finish here, it cannot finish on a conda-forge Azure job either.
+#
+# Manual trigger only (`workflow_dispatch`). It must never run on push, or it
+# would fire on every feedstock commit. Delete this file before opening any
+# recipe PR upstream; conda-smithy owns .github/workflows/ and will fight it.
+name: VMR build trial
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Build mode"
+        type: choice
+        required: true
+        default: source-build
+        options:
+          - source-build      # ./prep-source-build.sh && ./build.sh -sb   (Linux only)
+          - microsoft         # ./build.sh                                 (Linux/Mac/Win)
+      vmr_ref:
+        description: "dotnet/dotnet ref (e.g. main, v10.0.0)"
+        type: string
+        required: true
+        default: main
+      system_libs:
+        description: "--with-system-libs value; empty to skip the flag"
+        type: string
+        required: false
+        default: brotli+libunwind+rapidjson+zlib+zstd
+      target_rid:
+        description: "--rid to force a portable RID; empty to accept the distro-stamped default"
+        type: string
+        required: false
+        default: linux-x64
+      runner:
+        description: "Runner label"
+        type: choice
+        required: true
+        default: ubuntu-latest
+        options:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 360        # == conda-forge timeout_minutes default
+    steps:
+      - name: Record starting resources
+        run: |
+          echo "## Runner baseline" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          { echo "arch:   $(uname -m)"
+            echo "cpus:   $(nproc)"
+            echo "memory: $(free -g | awk '/^Mem:/{print $2" GiB"}')"
+            echo "disk:"; df -h / /mnt 2>/dev/null || df -h /
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      # Inlined rather than using a third-party action, so there is no unpinned
+      # external dependency in a workflow that runs for hours.
+      - name: Reclaim disk space
+        run: |
+          before=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          sudo rm -rf \
+            /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/powershell /usr/share/swift \
+            /usr/local/lib/node_modules || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          after=$(df --output=avail -BG / | tail -1 | tr -dc '0-9')
+          echo "Reclaimed $((after - before)) GiB; ${after} GiB now free on /"
+          echo "Reclaimed **$((after - before)) GiB**; **${after} GiB** free on / after cleanup" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install source-build prerequisites
+        run: |
+          sudo apt-get update -qq
+          # brotli-dev is the extra dep the VMR README calls out for source-build.
+          # The rest mirror acesnik's working 2022 list from dotnet-feedstock#16.
+          sudo apt-get install -y --no-install-recommends \
+            cmake llvm lld clang build-essential python-is-python3 curl git \
+            libicu-dev liblttng-ust-dev libssl-dev libnuma-dev libkrb5-dev \
+            zlib1g-dev ninja-build libbrotli-dev locales-all
+
+      - name: Clone the VMR
+        run: |
+          # Shallow: the VMR is ~2.1 GiB of git history we do not need for a
+          # timing trial. If Source Link metadata turns out to be required,
+          # drop --depth and pass --source-repository/--source-version instead.
+          /usr/bin/time -v git clone --depth 1 --branch "${{ inputs.vmr_ref }}" \
+            https://github.com/dotnet/dotnet vmr 2> clone.time || \
+            git clone --depth 1 --branch "${{ inputs.vmr_ref }}" \
+              https://github.com/dotnet/dotnet vmr
+          du -sh vmr | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Samples disk and memory every 30s so we get a peak, not just an endpoint.
+      - name: Start resource sampler
+        run: |
+          cat > /tmp/sample.sh <<'EOF'
+          #!/bin/bash
+          echo "elapsed_s,disk_used_G_root,disk_avail_G_root,mem_used_G,mem_avail_G" > /tmp/samples.csv
+          start=$(date +%s)
+          while true; do
+            now=$(date +%s)
+            read -r used avail <<<"$(df -BG --output=used,avail / | tail -1 | tr -dc '0-9 \n')"
+            read -r mused mavail <<<"$(free -g | awk '/^Mem:/{print $3" "$7}')"
+            echo "$((now-start)),${used},${avail},${mused},${mavail}" >> /tmp/samples.csv
+            sleep 30
+          done
+          EOF
+          chmod +x /tmp/sample.sh
+          nohup /tmp/sample.sh >/dev/null 2>&1 &
+          echo $! > /tmp/sampler.pid
+
+      - name: Prep source build
+        if: inputs.mode == 'source-build'
+        working-directory: vmr
+        run: |
+          start=$(date +%s)
+          # Downloads a bootstrap SDK + NuGet packages. On conda-forge this step
+          # is the policy problem; --with-sdk / --with-packages would replace it.
+          ./prep-source-build.sh 2>&1 | tail -40
+          echo "PREP_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+
+      - name: Build
+        working-directory: vmr
+        run: |
+          args=( --clean-while-building --ci )
+          if [ "${{ inputs.mode }}" = "source-build" ]; then args+=( -sb --online ); fi
+          if [ -n "${{ inputs.system_libs }}" ]; then args+=( --with-system-libs "${{ inputs.system_libs }}" ); fi
+          if [ -n "${{ inputs.target_rid }}" ]; then args+=( --rid "${{ inputs.target_rid }}" ); fi
+          echo "::notice::./build.sh ${args[*]}"
+          start=$(date +%s)
+          set +e
+          ./build.sh "${args[@]}" 2>&1 | tail -300
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "BUILD_SECONDS=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          echo "BUILD_RC=${rc}" >> "$GITHUB_ENV"
+          exit $rc
+
+      - name: Report
+        if: always()
+        run: |
+          kill "$(cat /tmp/sampler.pid)" 2>/dev/null || true
+          {
+            echo "## Result"
+            echo ""
+            echo "| metric | value |"
+            echo "|---|---|"
+            echo "| mode | \`${{ inputs.mode }}\` |"
+            echo "| VMR ref | \`${{ inputs.vmr_ref }}\` |"
+            echo "| runner | \`${{ inputs.runner }}\` (\`$(uname -m)\`, $(nproc) cpu) |"
+            echo "| exit code | \`${BUILD_RC:-n/a}\` |"
+            echo "| prep time | ${PREP_SECONDS:-0} s |"
+            echo "| build time | ${BUILD_SECONDS:-0} s ($(( ${BUILD_SECONDS:-0} / 60 )) min) |"
+            echo "| conda-forge ceiling | 360 min |"
+            if [ -f /tmp/samples.csv ]; then
+              echo "| peak disk used on / | $(awk -F, 'NR>1{if($2>m)m=$2}END{print m" GiB"}' /tmp/samples.csv) |"
+              echo "| min disk free on / | $(awk -F, 'NR>1{if(m==""||$3<m)m=$3}END{print m" GiB"}' /tmp/samples.csv) |"
+              echo "| peak memory used | $(awk -F, 'NR>1{if($4>m)m=$4}END{print m" GiB"}' /tmp/samples.csv) |"
+            fi
+            echo ""
+            echo "### Produced assets"
+            echo '```'
+            ls -lh vmr/artifacts/assets/Release/ 2>/dev/null || echo "(none -- build did not reach asset packaging)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload samples and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmr-trial-${{ inputs.mode }}-${{ inputs.runner }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            /tmp/samples.csv
+            vmr/artifacts/log/**
+            vmr/artifacts/assets/Release/*.tar.gz
